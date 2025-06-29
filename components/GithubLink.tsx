@@ -11,7 +11,7 @@ export function GithubLink ({ className, size, style }: GithubLinkProps) {
   return <a
     className={className}
     style={{ ...style, width: size, height: size }}
-    href={'https://github.com/gabotechs/datafusion-fiddle'}
+    href={'https://github.com/datafusion-contrib/datafusion-fiddle'}
     target={'_blank'}
     rel="noopener noreferrer"
   >
