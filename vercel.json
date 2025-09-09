@@ -3,10 +3,14 @@
   "outputDirectory": "dist",
   "framework": null,
   "devCommand": "vite --port $PORT",
+  "git": {
+    "lfs": true
+  },
   "functions": {
     "api/**/*.rs": {
-      "runtime": "vercel-rust@4.0.7",
-      "excludeFiles": "{dist,*.cache,node_modules,public,src,target}/**"
+      "runtime": "vercel-rust@4.0.9",
+      "excludeFiles": "**",
+      "includeFiles": "api/**"
     }
   },
   "rewrites": [

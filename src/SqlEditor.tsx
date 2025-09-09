@@ -13,6 +13,7 @@ import * as monaco from "monaco-editor";
 import { languages } from "monaco-editor";
 
 import pgWorker from 'monaco-sql-languages/esm/languages/pgsql/pgsql.worker?worker'
+import { Table, useTables } from "@/src/TablesContext";
 
 self.MonacoEnvironment = {
   getWorker: function () {
@@ -29,9 +30,25 @@ monaco.editor.setTheme('sql-dark');
 const tableRe = /\bcreate\s+table\s+([a-zA-Z_][a-zA-Z0-9_]+)\b/gi
 const columnRe = /^ +([a-zA-Z_][a-zA-Z0-9_]+)\s+/gm
 
+// Helper function to quote SQL identifiers if needed
+function quoteIdentifierIfNeeded(identifier: string): string {
+  // Check if identifier is a normal identifier (lowercase letters, numbers, underscore)
+  // and doesn't start with a number
+  const normalIdentifierRe = /^[a-z_][a-z0-9_]*$/;
+  
+  if (normalIdentifierRe.test(identifier)) {
+    return identifier;
+  } else {
+    return `"${identifier}"`;
+  }
+}
+
+// FIXME: I don't like global variables, but I don't want to think.
+const TABLES: Table[] = []
+
 setupLanguageFeatures(LanguageIdEnum.PG, {
   completionItems: {
-    completionService: async (_, __, ___, suggestions) => {
+    completionService: async (model, __, ___, suggestions) => {
       if (!suggestions) {
         return [];
       }
@@ -47,28 +64,25 @@ setupLanguageFeatures(LanguageIdEnum.PG, {
       let syntaxCompletionItems: ICompletionItem[] = [];
 
       syntax.forEach((item) => {
-        let re
+        let completions
         switch (item.syntaxContextType) {
           // if we are suggesting for columns...
           case EntityContextType.COLUMN:
-            re = columnRe;
-            break;
+            completions = TABLES
+              .flatMap(tbl => model.getValue().includes(tbl.name) ? tbl.columns : [])
+              .map(col => quoteIdentifierIfNeeded(col.name))
+            break
           // ...or for tables...
           case EntityContextType.CATALOG:
           case EntityContextType.DATABASE:
           case EntityContextType.TABLE:
-            re = tableRe;
-            break;
+            completions = TABLES
+              .map(tbl => quoteIdentifierIfNeeded(tbl.name))
+            break
         }
-        if (re) {
-          // do a very dummy parsing of the current active editors looking for CREATE TABLE
-          // statements and/or new lines with indented identifiers looking for column names.
-          const words = monaco.editor.getEditors()
-            .map(v => v.getValue())
-            .map(v => [...v.matchAll(re)])
-            .map(v => v.map(match => match[1]).filter(Boolean))
-            .flatMap(v => v)
-            .flatMap(v => ({
+        if (completions) {
+          const words = completions
+            .map(v => ({
               label: v,
               kind: languages.CompletionItemKind.Class,
               detail: item.syntaxContextType + ' suggestion',
@@ -102,6 +116,14 @@ export function SqlEditor ({ onChange, onSubmit, vim, onMount, ...props }: SqlEd
   // the first onSubmit value ever passed will be captured by the onMount closure.
   const onSubmitRef = React.useRef(onSubmit)
   onSubmitRef.current = onSubmit
+
+  const tables = useTables()
+  React.useEffect(() => {
+    if (tables.type === 'result') {
+      TABLES.splice(0)
+      TABLES.push(...tables.result)
+    }
+  }, [tables])
 
   const vimMode = useVimMode({ enabled: vim });
 

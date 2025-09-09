@@ -10,6 +10,11 @@ serde_json = { version = "1", features = ["raw_value"] }
 vercel_runtime = { version = "1.1.4" }
 datafusion = { version = "49.0.0" }
 serde = { version = "1.0.203", features = ["derive"] }
+futures = "0.3.31"
+
+[dev-dependencies]
+insta = "1.43.2"
+tabled = "0.20.0"
 
 # Each handler has to be specified as [[bin]]
 [[bin]]

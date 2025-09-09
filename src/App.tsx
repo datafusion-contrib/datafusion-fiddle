@@ -1,14 +1,13 @@
 import { useState } from "react";
 import * as monaco from 'monaco-editor'
+import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 
-import { executeStatements, SqlResponse } from "./api";
+import { useApi } from "./useApi";
 import { PlayButton } from "@/components/PlayButton";
-import { INIT_DDL, INIT_SELECT } from "./constants";
+import { INIT_SELECT } from "./constants";
 import { ResultVisualizer } from "./ResultVisualizer";
 import { ShareButton } from "@/components/ShareButton";
 import { SqlEditor } from "./SqlEditor";
-import { useScreenWidth } from "./useScreenWidth";
-import { DragHandle } from "@/components/DragHandle";
 import { VimButton } from "@/components/VimButton";
 import { useLocalStorage } from "@/src/useLocalStorage";
 import { DataFusionVersion } from "@/components/DataFusionVersion";
@@ -16,45 +15,21 @@ import { GithubLink } from "@/components/GithubLink";
 import { DataFusionIcon } from "@/components/DataFusionIcon";
 import { ShortcutsButton } from "@/components/ShortcutsButton";
 import { useShortcuts } from "@/src/useShortcuts";
+import { TablesExplorer } from "@/src/TablesExplorer";
 
-export type ApiState =
-  { type: 'nothing' } |
-  { type: 'loading' } |
-  { type: 'error', message: string } |
-  { type: 'result', result: SqlResponse }
 
-const [initDdl = INIT_DDL, initSelect = INIT_SELECT] = getStatementsFromUrl()
+const initSelect = getStatementFromUrl() ?? INIT_SELECT
 
 export default function App () {
   const [vim, setVim] = useLocalStorage('vim-mode', false)
-  const [apiState, setApiState] = useState<ApiState>({ type: 'nothing' })
-  const [ddlStatement, setDdlStatement] = useLocalStorage('ddl-statement', initDdl)
-  const [selectStatement, setSelectStatement] = useLocalStorage('select-statement', initSelect)
+  const api = useApi()
+  const [statement, setStatement] = useLocalStorage('statement', initSelect)
 
-  function execute () {
-    setApiState({ type: 'loading' })
-    executeStatements([
-      ...ddlStatement.split(';').map(_ => _.trim()).filter(_ => _.length > 0),
-      ...selectStatement.split(';').map(_ => _.trim()).filter(_ => _.length > 0),
-    ])
-      .then((result) => setApiState({ type: 'result', result }))
-      .catch((err) => setApiState({ type: 'error', message: err.toString() }))
-  }
+  const [editor, setEditor] = useState<monaco.editor.IStandaloneCodeEditor>()
 
-  const screenWidth = useScreenWidth()
-  const [midBarPosition, setMidBarPosition] = useLocalStorage('mid-bar-position', 0);
-
-  const [leftEditor, setLeftEditor] = useState<monaco.editor.IStandaloneCodeEditor>()
-  const [rightEditor, setRightEditor] = useState<monaco.editor.IStandaloneCodeEditor>()
-
-  useShortcuts(leftEditor, [
-    [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, execute],
-    [monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyL, () => rightEditor?.focus()],
-  ])
-
-  useShortcuts(rightEditor, [
-    [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, execute],
-    [monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyH, () => leftEditor?.focus()],
+  useShortcuts(editor, [
+    [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => api.execute(statement)],
+    [monaco.KeyMod.WinCtrl | monaco.KeyCode.KeyH, () => editor?.focus()],
   ])
 
   const HEADER_ICON_SIZE = 24
@@ -68,75 +43,81 @@ export default function App () {
           <PlayButton
             className={'ml-1'} // ml-1, otherwise it seems too close to the text
             size={HEADER_ICON_SIZE - 2} // -2, otherwise it seems too big
-            onClick={execute}
-            loading={apiState.type === 'loading'}
+            onClick={() => api.execute(statement)}
+            loading={api.state.type === 'loading'}
           />
           <ShareButton
             size={HEADER_ICON_SIZE}
-            getUrl={() => dumpStatementsIntoUrl(ddlStatement, selectStatement)}
+            getUrl={() => dumpStatementsIntoUrl(statement)}
           />
         </div>
         <div className={"px-4 flex flex-row items-center gap-4"}>
-          <ShortcutsButton size={HEADER_ICON_SIZE} />
+          <ShortcutsButton size={HEADER_ICON_SIZE}/>
           <VimButton size={HEADER_ICON_SIZE} enabled={vim} toggle={() => setVim(!vim)}/>
           <GithubLink size={HEADER_ICON_SIZE}/>
           <DataFusionVersion/>
         </div>
       </div>
-      <div className={"flex flex-row flex-grow min-h-0"}>
-        <SqlEditor
-          height={'100%'}
-          vim={vim}
-          width={screenWidth ? (screenWidth / 2 - 2 - midBarPosition) : '50%'}
-          value={ddlStatement}
-          onMount={setLeftEditor}
-          onChange={setDdlStatement}
-          onSubmit={execute}
-        />
-        <DragHandle onDrag={delta => setMidBarPosition(prev => prev - delta)} direction="horizontal"/>
-        <SqlEditor
-          height={'100%'}
-          vim={vim}
-          width={screenWidth ? (screenWidth / 2 - 2 + midBarPosition) : '50%'}
-          value={selectStatement}
-          onMount={v => {
-            v.focus() // focus the right editor on mount
-            setRightEditor(v)
-          }}
-          onChange={setSelectStatement}
-          onSubmit={execute}
-        />
-      </div>
-      <ResultVisualizer
-        className={`overflow-auto`}
-        state={apiState}
-      />
+
+      <PanelGroup direction="vertical" className="flex-grow">
+        <Panel defaultSize={api.state.type === 'nothing' ? 100 : 70} minSize={30}>
+          <PanelGroup direction="horizontal">
+            <Panel defaultSize={25} minSize={15} maxSize={50}>
+              <TablesExplorer className="h-full overflow-auto" />
+            </Panel>
+            <PanelResizeHandle className="w-1.5 bg-secondary-surface hover:bg-blue-900 cursor-col-resize" />
+            <Panel defaultSize={75} minSize={50}>
+              <SqlEditor
+                height={'100%'}
+                vim={vim}
+                width={'100%'}
+                value={statement}
+                onMount={v => {
+                  v.focus()
+                  setEditor(v)
+                }}
+                onChange={setStatement}
+                onSubmit={() => api.execute(statement)}
+              />
+            </Panel>
+          </PanelGroup>
+        </Panel>
+        {api.state.type !== 'nothing' && (
+          <>
+            <PanelResizeHandle className="h-1.5 w-full bg-secondary-surface hover:bg-blue-900 cursor-row-resize" />
+            <Panel defaultSize={30} minSize={10}>
+              <ResultVisualizer
+                className="overflow-auto h-full"
+                state={api.state}
+              />
+            </Panel>
+          </>
+        )}
+      </PanelGroup>
     </main>
   );
 }
 
-function dumpStatementsIntoUrl (ddl: string, select: string): string {
-  const q = btoa(JSON.stringify({ ddl, select }))
+function dumpStatementsIntoUrl (select: string): string {
+  const q = btoa(JSON.stringify({ select }))
   return window.location.origin + `?q=${q}`
 }
 
-function getStatementsFromUrl (): [string | undefined, string | undefined] {
+function getStatementFromUrl (): string | undefined {
   try {
     const urlParams = new URLSearchParams(window.location.search)
     const q = urlParams.get('q')
-    if (q == null) return [undefined, undefined]
+    if (q == null) return
     const parsed = JSON.parse(atob(q))
     if (
-      'ddl' in parsed &&
       'select' in parsed &&
-      typeof parsed.ddl === 'string' &&
       typeof parsed.select === 'string'
     ) {
-      return [parsed.ddl, parsed.select]
+      return parsed.select
     }
   } catch (error) {
     // this is fine
   }
-  return [undefined, undefined]
+  return
 }
 
