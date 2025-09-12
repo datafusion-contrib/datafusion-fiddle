@@ -1034,7 +1034,7 @@ dependencies = [
 [[package]]
 name = "datafusion-distributed"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-distributed?branch=main#bad700d5dad1f0b62554bfe3d91acc464db00ccc"
+source = "git+https://github.com/datafusion-contrib/datafusion-distributed?branch=robtandy%2Fbetter_graphviz_plans#f2a284435690e8a24734efca60a3168f6e4e1db3"
 dependencies = [
  "arrow-flight",
  "async-trait",
