@@ -10,6 +10,8 @@ import { ShareButton } from "@/components/ShareButton";
 import { SqlEditor } from "./SqlEditor";
 import { VimButton } from "@/components/VimButton";
 import { DistributedToggle } from "@/components/DistributedToggle";
+import { PartitionsSelect } from "@/components/PartitionsSelect";
+import { PartitionsPerTaskSelect } from "@/components/PartitionsPerTaskSelect";
 import { useLocalStorage } from "@/src/useLocalStorage";
 import { DataFusionVersion } from "@/components/DataFusionVersion";
 import { GithubLink } from "@/components/GithubLink";
@@ -25,7 +27,9 @@ export default function App () {
   const api = useApi()
   const [req, setReq] = useLocalStorage<ApiRequest>('last-request', {
     statement: INIT_SELECT,
-    distributed: false
+    distributed: false,
+    partitions: 4,
+    partitions_per_task: 2
   }, URL_REQ)
 
   const [editor, setEditor] = useState<monaco.editor.IStandaloneCodeEditor>()
@@ -49,9 +53,29 @@ export default function App () {
             onClick={() => api.execute(req)}
             loading={api.state.type === 'loading'}
           />
+          <PartitionsSelect
+            partitions={req.partitions}
+            onChange={(partitions) => setReq(prev => ({
+              ...prev,
+              partitions,
+              partitions_per_task: Math.floor(partitions / 2) || 1
+            }))}
+          />
+          {req.distributed && (
+            <PartitionsPerTaskSelect
+              key={req.partitions}
+              partitionsPerTask={req.partitions_per_task}
+              maxPartitions={req.partitions}
+              onChange={(partitions_per_task) => setReq(prev => ({ ...prev, partitions_per_task }))}
+            />
+          )}
           <DistributedToggle
             enabled={req.distributed}
-            onToggle={(distributed) => setReq(prev => ({ ...prev, distributed }))}
+            onToggle={(distributed) => setReq(prev => ({
+              ...prev,
+              distributed,
+              partitions_per_task: distributed ? (Math.floor(prev.partitions / 2) || 1) : prev.partitions_per_task
+            }))}
           />
           <ShareButton
             size={HEADER_ICON_SIZE}
@@ -120,9 +144,14 @@ function getReqFromUrl (): ApiRequest | undefined {
       'statement' in parsed &&
       typeof parsed.statement === 'string'
     ) {
+      const partitions = typeof parsed.partitions === 'number' && parsed.partitions >= 1 && parsed.partitions <= 10 ? parsed.partitions : 4;
+      const partitions_per_task = typeof parsed.partitions_per_task === 'number' && parsed.partitions_per_task >= 1 && parsed.partitions_per_task <= partitions ? parsed.partitions_per_task : Math.floor(partitions / 2) || 1;
+
       return {
         statement: parsed.statement,
         distributed: !!parsed.distributed,
+        partitions,
+        partitions_per_task,
       }
     }
   } catch (error) {
