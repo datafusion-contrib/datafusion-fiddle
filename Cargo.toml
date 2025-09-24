@@ -9,7 +9,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 # Documentation: https://docs.rs/vercel_runtime/latest/vercel_runtime
 vercel_runtime = { version = "1.1.4" }
 datafusion = { version = "49.0.0" }
-datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", branch = "main" }
+datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", branch = "robtandy/move_chrono_to_main_dependencies" }
 serde = { version = "1.0.203", features = ["derive"] }
 futures = "0.3.31"
 url = "2.5.7"

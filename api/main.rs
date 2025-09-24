@@ -7,8 +7,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{displayable, execute_stream, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_distributed::{
-    ArrowFlightEndpoint, BoxCloneSyncChannel, ChannelResolver, DistributedExt,
-    DistributedPhysicalOptimizerRule, DistributedSessionBuilderContext,
+    display_plan_graphviz, ArrowFlightEndpoint, BoxCloneSyncChannel, ChannelResolver,
+    DistributedExt, DistributedPhysicalOptimizerRule, DistributedSessionBuilderContext,
 };
 use futures::TryStreamExt;
 use hyper_util::rt::TokioIo;
@@ -99,6 +99,18 @@ async fn main() -> Result<(), Error> {
 struct SqlRequest {
     distributed: bool,
     stmts: Vec<String>,
+    #[serde(default = "default_partitions")]
+    partitions: usize,
+    #[serde(default = "default_partitions_per_task")]
+    partitions_per_task: usize,
+}
+
+fn default_partitions() -> usize {
+    4
+}
+
+fn default_partitions_per_task() -> usize {
+    2
 }
 
 pub async fn handler(req: Request) -> Result<Response<Body>, Error> {
@@ -107,7 +119,15 @@ pub async fn handler(req: Request) -> Result<Response<Body>, Error> {
         None => return throw_error("No sql request was passed", None, StatusCode::BAD_REQUEST),
     };
 
-    let res = match execute_statements(req.stmts, "api/parquet", req.distributed).await {
+    let res = match execute_statements(
+        req.stmts,
+        "api/parquet",
+        req.distributed,
+        req.partitions,
+        req.partitions_per_task,
+    )
+    .await
+    {
         Ok(res) => res,
         Err(err) => {
             return throw_error(
@@ -152,23 +172,42 @@ struct SqlResult {
     rows: Vec<Vec<String>>,
     logical_plan: String,
     physical_plan: String,
+    // if the plan is distributed, this contains the graphviz representation in dot format
+    graphviz: String,
+    // if the plan is distributed, this will be replaced browserside, with the svg html of the graphviz plan
+    graphviz_plan: String,
 }
 
 async fn execute_statements(
     stmts: Vec<String>,
     path: impl Display,
     distributed: bool,
+    partitions: usize,
+    partitions_per_task: usize,
 ) -> datafusion::error::Result<SqlResult> {
     let options = FormatOptions::default().with_display_error(true);
-    let cfg = SessionConfig::new().with_information_schema(true);
+    let mut cfg = SessionConfig::new()
+        .with_information_schema(true)
+        .with_target_partitions(partitions);
 
     let mut builder = SessionStateBuilder::new()
         .with_default_features()
-        .with_config(cfg);
+        .with_config(cfg.clone());
     if distributed {
+        cfg = cfg.set_str(
+            "datafusion.optimizer.hash_join_single_partition_threshold",
+            "0",
+        );
+        cfg = cfg.set_str(
+            "datafusion.optimizer.hash_join_single_partition_threshold.rows",
+            "0",
+        );
+
         builder = builder
+            .with_config(cfg)
             .with_physical_optimizer_rule(Arc::new(
-                DistributedPhysicalOptimizerRule::default().with_maximum_partitions_per_task(1),
+                DistributedPhysicalOptimizerRule::default()
+                    .with_maximum_partitions_per_task(partitions_per_task),
             ))
             .with_distributed_channel_resolver(CHANNEL_RESOLVER.clone());
     }
@@ -222,11 +261,17 @@ async fn execute_statements(
         rows.push(vec!["...".to_string(); columns.len()]);
     }
 
+    let physical_plan_str =
+        display_physical_plan(&physical_plan).unwrap_or_else(|err| err.to_string());
+    let graphviz_str = display_graphviz_plan(&physical_plan).unwrap_or_else(|err| err.to_string());
+
     Ok(SqlResult {
         columns,
         rows,
         logical_plan: logical_plan_str,
-        physical_plan: display_physical_plan(&physical_plan).unwrap_or_else(|err| err.to_string()),
+        physical_plan: physical_plan_str,
+        graphviz_plan: "".to_owned(),
+        graphviz: graphviz_str,
     })
 }
 
@@ -236,6 +281,11 @@ fn display_physical_plan(physical_plan: &Arc<dyn ExecutionPlan>) -> Result<Strin
     let curr_dir = curr_dir.trim_start_matches("/");
     let physical_plan_str = physical_plan_str.replace(curr_dir, "");
     Ok(physical_plan_str)
+}
+
+fn display_graphviz_plan(physical_plan: &Arc<dyn ExecutionPlan>) -> Result<String, Error> {
+    let graphviz_plan_str = display_plan_graphviz(physical_plan.clone())?;
+    Ok(graphviz_plan_str)
 }
 
 async fn load_parquet_files(base: String, ctx: &SessionContext) -> Result<(), DataFusionError> {
@@ -270,6 +320,8 @@ mod tests {
             ],
             format!("{}/api/parquet", env!("CARGO_MANIFEST_DIR")),
             false,
+            4,
+            2,
         )
         .await?;
 
@@ -289,6 +341,8 @@ mod tests {
             vec!["SELECT * FROM weather LIMIT 10".to_string()],
             format!("{}/api/parquet", env!("CARGO_MANIFEST_DIR")),
             false,
+            4,
+            2,
         )
         .await?;
 
@@ -346,6 +400,8 @@ where
             .to_string()],
             format!("{}/api/parquet", env!("CARGO_MANIFEST_DIR")),
             true,
+            4,
+            2,
         )
         .await?;
 
