@@ -628,7 +628,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link 0.2.0",
 ]
 
@@ -1034,10 +1036,11 @@ dependencies = [
 [[package]]
 name = "datafusion-distributed"
 version = "0.1.0"
-source = "git+https://github.com/datafusion-contrib/datafusion-distributed?branch=main#bad700d5dad1f0b62554bfe3d91acc464db00ccc"
+source = "git+https://github.com/datafusion-contrib/datafusion-distributed?rev=2df3467444da4aae9819127d6426fa0d1d287652#2df3467444da4aae9819127d6426fa0d1d287652"
 dependencies = [
  "arrow-flight",
  "async-trait",
+ "chrono",
  "dashmap",
  "datafusion",
  "datafusion-proto",
@@ -1046,6 +1049,7 @@ dependencies = [
  "http",
  "itertools",
  "object_store",
+ "pin-project",
  "prost",
  "rand 0.8.5",
  "tokio",

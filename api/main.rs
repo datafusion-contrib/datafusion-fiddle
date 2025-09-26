@@ -168,7 +168,9 @@ async fn execute_statements(
     if distributed {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(
-                DistributedPhysicalOptimizerRule::default().with_maximum_partitions_per_task(1),
+                DistributedPhysicalOptimizerRule::default()
+                    .with_network_shuffle_tasks(4)
+                    .with_network_coalesce_tasks(4),
             ))
             .with_distributed_channel_resolver(CHANNEL_RESOLVER.clone());
     }
@@ -350,7 +352,7 @@ where
         .await?;
 
         insta::assert_snapshot!(result.physical_plan, @r"
-        ┌───── Stage 2   Tasks: t0:[p0] 
+        ┌───── Stage 3   Tasks: t0:[p0] 
         │ ProjectionExec: expr=[CAST(sum(lineitem.l_extendedprice)@0 AS Float64) / 7 as avg_yearly]
         │   AggregateExec: mode=Final, gby=[], aggr=[sum(lineitem.l_extendedprice)]
         │     CoalescePartitionsExec
@@ -362,20 +364,26 @@ where
         │                 CoalesceBatchesExec: target_batch_size=8192
         │                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[p_partkey@0, l_quantity@2, l_extendedprice@3]
         │                     CoalescePartitionsExec
-        │                       CoalesceBatchesExec: target_batch_size=8192
-        │                         FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
-        │                           DataSourceExec: file_groups={16 groups: [[/api/parquet/part/1.parquet], [/api/parquet/part/10.parquet], [/api/parquet/part/11.parquet], [/api/parquet/part/12.parquet], [/api/parquet/part/13.parquet], ...]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@1 = Brand#23 AND p_container@2 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
-        │                     DataSourceExec: file_groups={16 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/10.parquet], [/api/parquet/lineitem/11.parquet], [/api/parquet/lineitem/12.parquet], [/api/parquet/lineitem/13.parquet], ...]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet
+        │                       NetworkCoalesceExec read_from=Stage 1, output_partitions=64, input_tasks=4
+        │                     DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet
         │             ProjectionExec: expr=[CAST(0.2 * CAST(avg(lineitem.l_quantity)@1 AS Float64) AS Decimal128(30, 15)) as Float64(0.2) * avg(lineitem.l_quantity), l_partkey@0 as l_partkey]
         │               AggregateExec: mode=FinalPartitioned, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
         │                 CoalesceBatchesExec: target_batch_size=8192
-        │                   ArrowFlightReadExec input_stage=1, input_partitions=16, input_tasks=16
+        │                   NetworkShuffleExec read_from=Stage 2, output_partitions=16, n_tasks=1, input_tasks=4
         └──────────────────────────────────────────────────
-          ┌───── Stage 1   Tasks: t0:[p0] t1:[p1] t2:[p2] t3:[p3] t4:[p4] t5:[p5] t6:[p6] t7:[p7] t8:[p8] t9:[p9] t10:[p10] t11:[p11] t12:[p12] t13:[p13] t14:[p14] t15:[p15] 
-          │ RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=1
-          │   PartitionIsolatorExec Tasks: t0:[p0,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__] t1:[__,p0,__,__,__,__,__,__,__,__,__,__,__,__,__,__] t2:[__,__,p0,__,__,__,__,__,__,__,__,__,__,__,__,__] t3:[__,__,__,p0,__,__,__,__,__,__,__,__,__,__,__,__] t4:[__,__,__,__,p0,__,__,__,__,__,__,__,__,__,__,__] t5:[__,__,__,__,__,p0,__,__,__,__,__,__,__,__,__,__] t6:[__,__,__,__,__,__,p0,__,__,__,__,__,__,__,__,__] t7:[__,__,__,__,__,__,__,p0,__,__,__,__,__,__,__,__] t8:[__,__,__,__,__,__,__,__,p0,__,__,__,__,__,__,__] t9:[__,__,__,__,__,__,__,__,__,p0,__,__,__,__,__,__] t10:[__,__,__,__,__,__,__,__,__,__,p0,__,__,__,__,__] t11:[__,__,__,__,__,__,__,__,__,__,__,p0,__,__,__,__] t12:[__,__,__,__,__,__,__,__,__,__,__,__,p0,__,__,__] t13:[__,__,__,__,__,__,__,__,__,__,__,__,__,p0,__,__] t14:[__,__,__,__,__,__,__,__,__,__,__,__,__,__,p0,__] t15:[__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,p0] 
+          ┌───── Stage 1   Tasks: t0:[p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15] t1:[p16,p17,p18,p19,p20,p21,p22,p23,p24,p25,p26,p27,p28,p29,p30,p31] t2:[p32,p33,p34,p35,p36,p37,p38,p39,p40,p41,p42,p43,p44,p45,p46,p47] t3:[p48,p49,p50,p51,p52,p53,p54,p55,p56,p57,p58,p59,p60,p61,p62,p63] 
+          │ CoalesceBatchesExec: target_batch_size=8192
+          │   FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
+          │     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
+          │       PartitionIsolatorExec Tasks: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0] 
+          │         DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet], [/api/parquet/part/2.parquet], [/api/parquet/part/3.parquet], [/api/parquet/part/4.parquet]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@1 = Brand#23 AND p_container@2 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          └──────────────────────────────────────────────────
+          ┌───── Stage 2   Tasks: t0:[p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15] t1:[p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15] t2:[p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15] t3:[p0,p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15] 
+          │ RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=16
+          │   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
           │     AggregateExec: mode=Partial, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
-          │       DataSourceExec: file_groups={16 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/10.parquet], [/api/parquet/lineitem/11.parquet], [/api/parquet/lineitem/12.parquet], [/api/parquet/lineitem/13.parquet], ...]}, projection=[l_partkey, l_quantity], file_type=parquet
+          │       PartitionIsolatorExec Tasks: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0] 
+          │         DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity], file_type=parquet
           └──────────────────────────────────────────────────
         ");
         Ok(())

@@ -8,17 +8,17 @@ tokio = { version = "1", features = ["macros"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Documentation: https://docs.rs/vercel_runtime/latest/vercel_runtime
 vercel_runtime = { version = "1.1.4" }
-datafusion = { version = "49.0.0" }
-datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", branch = "main" }
+datafusion = { version = "49.0.0", default-features = false }
+datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "2df3467444da4aae9819127d6426fa0d1d287652" }
 serde = { version = "1.0.203", features = ["derive"] }
 futures = "0.3.31"
 url = "2.5.7"
 async-trait = "0.1.89"
-tonic = "0.12.3"
+tonic = { version="0.12.3", default-features = false }
 tokio-stream = "0.1.17"
 tower = "0.5.2"
 hyper-util = "0.1.16"
-arrow-flight = "55.2.0"
+arrow-flight = { version = "55.2.0", default-features = false }
 
 [dev-dependencies]
 insta = "1.43.2"
