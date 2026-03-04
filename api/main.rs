@@ -1,5 +1,4 @@
 use arrow_flight::flight_service_client::FlightServiceClient;
-use arrow_flight::flight_service_server::FlightServiceServer;
 use async_trait::async_trait;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -8,8 +7,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_distributed::{
-    display_plan_ascii, ArrowFlightEndpoint, BoxCloneSyncChannel, ChannelResolver, DistributedExt,
-    DistributedPhysicalOptimizerRule, DistributedSessionBuilderContext,
+    create_flight_client, display_plan_ascii, BoxCloneSyncChannel, ChannelResolver, DistributedExt,
+    DistributedPhysicalOptimizerRule, Worker, WorkerQueryContext, WorkerResolver,
 };
 use futures::TryStreamExt;
 use hyper_util::rt::TokioIo;
@@ -18,7 +17,7 @@ use serde_json::json;
 use std::env::current_dir;
 use std::fmt::Display;
 use std::fs;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use tonic::transport::{Endpoint, Server};
 use url::Url;
 use vercel_runtime::{run, Body, Error, Request, RequestPayloadExt, Response, StatusCode};
@@ -26,6 +25,8 @@ use vercel_runtime::{run, Body, Error, Request, RequestPayloadExt, Response, Sta
 const MAX_RESULTS: usize = 500;
 
 const DUMMY_URL: &str = "http://localhost:50051";
+
+struct InMemoryWorkerResolver;
 
 #[derive(Clone)]
 struct InMemoryChannelResolver {
@@ -51,22 +52,17 @@ impl InMemoryChannelResolver {
         };
         let this_clone = this.clone();
 
-        let endpoint =
-            ArrowFlightEndpoint::try_new(move |ctx: DistributedSessionBuilderContext| {
-                let this = this.clone();
-                async move {
-                    let builder = SessionStateBuilder::new()
-                        .with_default_features()
-                        .with_distributed_channel_resolver(this)
-                        .with_runtime_env(ctx.runtime_env.clone());
-                    Ok(builder.build())
-                }
-            })
-            .unwrap();
+        let endpoint = Worker::from_session_builder(move |ctx: WorkerQueryContext| {
+            let this = this.clone();
+            async move {
+                let builder = ctx.builder.with_distributed_channel_resolver(this);
+                Ok(builder.build())
+            }
+        });
 
         tokio::spawn(async move {
             Server::builder()
-                .add_service(FlightServiceServer::new(endpoint))
+                .add_service(endpoint.into_flight_server())
                 .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server)))
                 .await
         });
@@ -75,22 +71,21 @@ impl InMemoryChannelResolver {
     }
 }
 
-#[async_trait]
-impl ChannelResolver for InMemoryChannelResolver {
+impl WorkerResolver for InMemoryWorkerResolver {
     fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
         Ok(vec![Url::parse(DUMMY_URL).unwrap(); 16])
     }
+}
 
+#[async_trait]
+impl ChannelResolver for InMemoryChannelResolver {
     async fn get_flight_client_for_url(
         &self,
         _: &Url,
     ) -> Result<FlightServiceClient<BoxCloneSyncChannel>, DataFusionError> {
-        Ok(FlightServiceClient::new(self.channel.clone()))
+        Ok(create_flight_client(self.channel.clone()))
     }
 }
-
-static CHANNEL_RESOLVER: LazyLock<InMemoryChannelResolver> =
-    LazyLock::new(InMemoryChannelResolver::new);
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -165,10 +160,10 @@ async fn execute_statements(
     let mut builder = SessionStateBuilder::new()
         .with_default_features()
         .with_config(cfg)
-        .with_distributed_channel_resolver(CHANNEL_RESOLVER.clone());
+        .with_distributed_worker_resolver(InMemoryWorkerResolver)
+        .with_distributed_channel_resolver(InMemoryChannelResolver::new());
     if stmts.iter().any(|v| v.contains("distributed.")) {
-        builder = builder
-            .with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+        builder = builder.with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
     }
     let ctx = Arc::new(SessionContext::new_with_state(builder.build()));
     load_parquet_files(path.to_string(), &ctx).await?;
@@ -292,25 +287,25 @@ mod tests {
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
         | MinTemp [Float64] | MaxTemp [Float64] | Rainfall [Float64] | Evaporation [Float64] | Sunshine [Utf8View] | WindGustDir [Utf8View] | WindGustSpeed [Utf8View] | WindDir9am [Utf8View] | WindDir3pm [Utf8View] | WindSpeed9am [Utf8View] | WindSpeed3pm [Int64] | Humidity9am [Int64] | Humidity3pm [Int64] | Pressure9am [Float64] | Pressure3pm [Float64] | Cloud9am [Int64] | Cloud3pm [Int64] | Temp9am [Float64] | Temp3pm [Float64] | RainToday [Utf8View] | RISK_MM [Float64] | RainTomorrow [Utf8View] |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 8.0               | 24.3              | 0.0                | 3.4                   | 6.3                 | NW                     | 30                       | SW                    | NW                    | 6                       | 20                   | 68                  | 29                  | 1019.7                | 1015.0                | 7                | 7                | 14.4              | 23.6              | No                   | 3.6               | Yes                     |
+        | 0.5               | 17.1              | 0.0                | 4.0                   | 9.4                 | NW                     | 31                       | ESE                   | W                     | 6                       | 13                   | 74                  | 42                  | 1020.8                | 1017.4                | 1                | 1                | 7.4               | 16.2              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 14.0              | 26.9              | 3.6                | 4.4                   | 9.7                 | ENE                    | 39                       | E                     | W                     | 4                       | 17                   | 80                  | 36                  | 1012.4                | 1008.4                | 5                | 3                | 17.5              | 25.7              | Yes                  | 3.6               | Yes                     |
+        | -0.9              | 16.7              | 0.0                | 2.4                   | 9.3                 | NNW                    | 30                       | SW                    | NNW                   | 2                       | 15                   | 76                  | 42                  | 1022.7                | 1018.5                | 5                | 2                | 6.2               | 15.4              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 13.7              | 23.4              | 3.6                | 5.8                   | 3.3                 | NW                     | 85                       | N                     | NNE                   | 6                       | 6                    | 82                  | 69                  | 1009.5                | 1007.2                | 8                | 7                | 15.4              | 20.2              | Yes                  | 39.8              | Yes                     |
+        | 0.4               | 19.0              | 0.0                | 3.4                   | 8.3                 | NW                     | 39                       | NE                    | WNW                   | 2                       | 19                   | 76                  | 41                  | 1019.8                | 1015.8                | 6                | 5                | 7.7               | 18.5              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 13.3              | 15.5              | 39.8               | 7.2                   | 9.1                 | NW                     | 54                       | WNW                   | W                     | 30                      | 24                   | 62                  | 56                  | 1005.5                | 1007.0                | 2                | 7                | 13.5              | 14.1              | Yes                  | 2.8               | Yes                     |
+        | 7.5               | 16.8              | 0.0                | 2.8                   | 3                   | NW                     | 41                       | W                     | NW                    | 7                       | 26                   | 70                  | 53                  | 1018.0                | 1013.8                | 7                | 7                | 12.5              | 15.4              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 7.6               | 16.1              | 2.8                | 5.6                   | 10.6                | SSE                    | 50                       | SSE                   | ESE                   | 20                      | 28                   | 68                  | 49                  | 1018.3                | 1018.5                | 7                | 7                | 11.1              | 15.4              | Yes                  | 0.0               | No                      |
+        | 8.3               | 17.6              | 0.0                | 3.4                   | 9.4                 | WNW                    | 43                       | NW                    | WNW                   | 17                      | 30                   | 73                  | 43                  | 1015.8                | 1013.5                | 1                | 1                | 12.4              | 16.5              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 6.2               | 16.9              | 0.0                | 5.8                   | 8.2                 | SE                     | 44                       | SE                    | E                     | 20                      | 24                   | 70                  | 57                  | 1023.8                | 1021.7                | 7                | 5                | 10.9              | 14.8              | No                   | 0.2               | No                      |
+        | -0.2              | 18.1              | 0.0                | 4.4                   | 9.4                 | NW                     | 24                       | NA                    | NW                    | 0                       | 9                    | 80                  | 44                  | 1021.4                | 1018.9                | 1                | 1                | 6.7               | 16.9              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 6.1               | 18.2              | 0.2                | 4.2                   | 8.4                 | SE                     | 43                       | SE                    | ESE                   | 19                      | 26                   | 63                  | 47                  | 1024.6                | 1022.2                | 4                | 6                | 12.4              | 17.3              | No                   | 0.0               | No                      |
+        | 0.1               | 21.0              | 0.0                | 2.2                   | 9.2                 | NNW                    | 17                       | WNW                   | N                     | 2                       | 9                    | 78                  | 36                  | 1023.2                | 1020.3                | 0                | 1                | 7.6               | 20.7              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 8.3               | 17.0              | 0.0                | 5.6                   | 4.6                 | E                      | 41                       | SE                    | E                     | 11                      | 24                   | 65                  | 57                  | 1026.2                | 1024.2                | 6                | 7                | 12.1              | 15.5              | No                   | 0.0               | No                      |
+        | 1.5               | 20.9              | 0.0                | 2.4                   | 9.3                 | NW                     | 20                       | NW                    | NNW                   | 2                       | 9                    | 80                  | 41                  | 1023.2                | 1020.0                | 1                | 1                | 8.4               | 20.9              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 8.8               | 19.5              | 0.0                | 4.0                   | 4.1                 | S                      | 48                       | E                     | ENE                   | 19                      | 17                   | 70                  | 48                  | 1026.1                | 1022.7                | 7                | 7                | 14.1              | 18.9              | No                   | 16.2              | Yes                     |
+        | 8.3               | 17.4              | 0.0                | 2.0                   | 1.6                 | E                      | 20                       | WSW                   | NE                    | 6                       | 11                   | 80                  | 52                  | 1024.4                | 1021.5                | 7                | 7                | 13.5              | 17.2              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
-        | 8.4               | 22.8              | 16.2               | 5.4                   | 7.7                 | E                      | 31                       | S                     | ESE                   | 7                       | 6                    | 82                  | 32                  | 1024.1                | 1020.7                | 7                | 1                | 13.3              | 21.7              | Yes                  | 0.0               | No                      |
+        | 9.4               | 19.2              | 0.0                | 2.2                   | 7.7                 | NA                     | 24                       | E                     | NNW                   | 4                       | 15                   | 73                  | 47                  | 1024.2                | 1020.3                | 7                | 1                | 12.1              | 18.8              | No                   | 0.0               | No                      |
         +-------------------+-------------------+--------------------+-----------------------+---------------------+------------------------+--------------------------+-----------------------+-----------------------+-------------------------+----------------------+---------------------+---------------------+-----------------------+-----------------------+------------------+------------------+-------------------+-------------------+----------------------+-------------------+-------------------------+
         ");
         Ok(())
@@ -353,33 +348,28 @@ where
         │   AggregateExec: mode=Final, gby=[], aggr=[sum(lineitem.l_extendedprice)]
         │     CoalescePartitionsExec
         │       AggregateExec: mode=Partial, gby=[], aggr=[sum(lineitem.l_extendedprice)]
-        │         CoalesceBatchesExec: target_batch_size=8192
-        │           HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@2, l_partkey@1)], filter=CAST(l_quantity@0 AS Decimal128(30, 15)) < Float64(0.2) * avg(lineitem.l_quantity)@1, projection=[l_extendedprice@1]
-        │             CoalescePartitionsExec
-        │               ProjectionExec: expr=[l_quantity@1 as l_quantity, l_extendedprice@2 as l_extendedprice, p_partkey@0 as p_partkey]
-        │                 CoalesceBatchesExec: target_batch_size=8192
-        │                   HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[p_partkey@0, l_quantity@2, l_extendedprice@3]
-        │                     CoalescePartitionsExec
-        │                       [Stage 1] => NetworkCoalesceExec: output_partitions=64, input_tasks=4
-        │                     DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet, predicate=DynamicFilter [ empty ]
-        │             ProjectionExec: expr=[CAST(0.2 * CAST(avg(lineitem.l_quantity)@1 AS Float64) AS Decimal128(30, 15)) as Float64(0.2) * avg(lineitem.l_quantity), l_partkey@0 as l_partkey]
-        │               AggregateExec: mode=FinalPartitioned, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
-        │                 [Stage 2] => NetworkShuffleExec: output_partitions=16, input_tasks=4
+        │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@2, l_partkey@1)], filter=CAST(l_quantity@0 AS Decimal128(30, 15)) < Float64(0.2) * avg(lineitem.l_quantity)@1, projection=[l_extendedprice@1]
+        │           CoalescePartitionsExec
+        │             ProjectionExec: expr=[l_quantity@1 as l_quantity, l_extendedprice@2 as l_extendedprice, p_partkey@0 as p_partkey]
+        │               HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[p_partkey@0, l_quantity@2, l_extendedprice@3]
+        │                 CoalescePartitionsExec
+        │                   [Stage 1] => NetworkCoalesceExec: output_partitions=64, input_tasks=4
+        │                 DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet, predicate=DynamicFilter [ empty ]
+        │           ProjectionExec: expr=[CAST(0.2 * CAST(avg(lineitem.l_quantity)@1 AS Float64) AS Decimal128(30, 15)) as Float64(0.2) * avg(lineitem.l_quantity), l_partkey@0 as l_partkey]
+        │             AggregateExec: mode=FinalPartitioned, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
+        │               [Stage 2] => NetworkShuffleExec: output_partitions=16, input_tasks=4
         └──────────────────────────────────────────────────
           ┌───── Stage 1 ── Tasks: t0:[p0..p15] t1:[p16..p31] t2:[p32..p47] t3:[p48..p63] 
-          │ CoalesceBatchesExec: target_batch_size=8192
-          │   FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
-          │     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-          │       PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0] 
-          │         DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet], [/api/parquet/part/2.parquet], [/api/parquet/part/3.parquet], [/api/parquet/part/4.parquet]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@1 = Brand#23 AND p_container@2 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │ FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
+          │   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
+          │     PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0]
+          │       DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet], [/api/parquet/part/2.parquet], [/api/parquet/part/3.parquet], [/api/parquet/part/4.parquet]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
           └──────────────────────────────────────────────────
           ┌───── Stage 2 ── Tasks: t0:[p0..p15] t1:[p0..p15] t2:[p0..p15] t3:[p0..p15] 
-          │ CoalesceBatchesExec: target_batch_size=8192
-          │   RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=16
-          │     RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-          │       AggregateExec: mode=Partial, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
-          │         PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0] 
-          │           DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │ RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=1
+          │   AggregateExec: mode=Partial, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
+          │     PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0]
+          │       DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
           └──────────────────────────────────────────────────
         ");
         Ok(())
