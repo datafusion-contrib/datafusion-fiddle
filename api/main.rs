@@ -1,4 +1,3 @@
-use arrow_flight::flight_service_client::FlightServiceClient;
 use async_trait::async_trait;
 use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -7,8 +6,8 @@ use datafusion::execution::SessionStateBuilder;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_distributed::{
-    create_flight_client, display_plan_ascii, BoxCloneSyncChannel, ChannelResolver, DistributedExt,
-    DistributedPhysicalOptimizerRule, Worker, WorkerQueryContext, WorkerResolver,
+    create_worker_client, display_plan_ascii, BoxCloneSyncChannel, ChannelResolver, DistributedExt,
+    SessionStateBuilderExt, Worker, WorkerQueryContext, WorkerResolver, WorkerServiceClient,
 };
 use futures::TryStreamExt;
 use hyper_util::rt::TokioIo;
@@ -62,7 +61,7 @@ impl InMemoryChannelResolver {
 
         tokio::spawn(async move {
             Server::builder()
-                .add_service(endpoint.into_flight_server())
+                .add_service(endpoint.into_worker_server())
                 .serve_with_incoming(tokio_stream::once(Ok::<_, std::io::Error>(server)))
                 .await
         });
@@ -79,11 +78,11 @@ impl WorkerResolver for InMemoryWorkerResolver {
 
 #[async_trait]
 impl ChannelResolver for InMemoryChannelResolver {
-    async fn get_flight_client_for_url(
+    async fn get_worker_client_for_url(
         &self,
         _: &Url,
-    ) -> Result<FlightServiceClient<BoxCloneSyncChannel>, DataFusionError> {
-        Ok(create_flight_client(self.channel.clone()))
+    ) -> Result<WorkerServiceClient<BoxCloneSyncChannel>, DataFusionError> {
+        Ok(create_worker_client(self.channel.clone()))
     }
 }
 
@@ -163,7 +162,7 @@ async fn execute_statements(
         .with_distributed_worker_resolver(InMemoryWorkerResolver)
         .with_distributed_channel_resolver(InMemoryChannelResolver::new());
     if stmts.iter().any(|v| v.contains("distributed.")) {
-        builder = builder.with_physical_optimizer_rule(Arc::new(DistributedPhysicalOptimizerRule))
+        builder = builder.with_distributed_planner()
     }
     let ctx = Arc::new(SessionContext::new_with_state(builder.build()));
     load_parquet_files(path.to_string(), &ctx).await?;
@@ -316,7 +315,7 @@ mod tests {
         let result = execute_statements(
             // TPCH 17
             vec![
-                "SET distributed.files_per_task = 1;".into(),
+                "SET distributed.file_scan_config_bytes_per_partition = 1;".into(),
                 r#"
 select
         sum(l_extendedprice) / 7.0 as avg_yearly
@@ -343,33 +342,63 @@ where
         .await?;
 
         insta::assert_snapshot!(result.physical_plan, @r"
-        ┌───── DistributedExec ── Tasks: t0:[p0] 
+        ┌───── DistributedExec ── Tasks: t0:[p0]
         │ ProjectionExec: expr=[CAST(sum(lineitem.l_extendedprice)@0 AS Float64) / 7 as avg_yearly]
         │   AggregateExec: mode=Final, gby=[], aggr=[sum(lineitem.l_extendedprice)]
         │     CoalescePartitionsExec
         │       AggregateExec: mode=Partial, gby=[], aggr=[sum(lineitem.l_extendedprice)]
         │         HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@2, l_partkey@1)], filter=CAST(l_quantity@0 AS Decimal128(30, 15)) < Float64(0.2) * avg(lineitem.l_quantity)@1, projection=[l_extendedprice@1]
         │           CoalescePartitionsExec
-        │             ProjectionExec: expr=[l_quantity@1 as l_quantity, l_extendedprice@2 as l_extendedprice, p_partkey@0 as p_partkey]
-        │               HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[p_partkey@0, l_quantity@2, l_extendedprice@3]
-        │                 CoalescePartitionsExec
-        │                   [Stage 1] => NetworkCoalesceExec: output_partitions=64, input_tasks=4
-        │                 DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet, predicate=DynamicFilter [ empty ]
+        │             HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(p_partkey@0, l_partkey@0)], projection=[l_quantity@2, l_extendedprice@3, p_partkey@0]
+        │               CoalescePartitionsExec
+        │                 [Stage 1] => NetworkCoalesceExec: output_partitions=256, input_tasks=16
+        │               DistributedLeafExec:
+        │                 t0: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:0..99067, /api/parquet/lineitem/2.parquet:0..1165], [/api/parquet/lineitem/2.parquet:1165..101397], [/api/parquet/lineitem/2.parquet:101397..103266, /api/parquet/lineitem/3.parquet:0..98363], [/api/parquet/lineitem/3.parquet:98363..99389, /api/parquet/lineitem/4.parquet:0..99206]]}, projection=[l_partkey, l_quantity, l_extendedprice], file_type=parquet, predicate=DynamicFilter [ empty ]
         │           ProjectionExec: expr=[CAST(0.2 * CAST(avg(lineitem.l_quantity)@1 AS Float64) AS Decimal128(30, 15)) as Float64(0.2) * avg(lineitem.l_quantity), l_partkey@0 as l_partkey]
         │             AggregateExec: mode=FinalPartitioned, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
-        │               [Stage 2] => NetworkShuffleExec: output_partitions=16, input_tasks=4
+        │               [Stage 2] => NetworkShuffleExec: output_partitions=16, input_tasks=16
         └──────────────────────────────────────────────────
-          ┌───── Stage 1 ── Tasks: t0:[p0..p15] t1:[p16..p31] t2:[p32..p47] t3:[p48..p63] 
+          ┌───── Stage 1 ── Tasks: t0:[p0..p15] t1:[p16..p31] t2:[p32..p47] t3:[p48..p63] t4:[p64..p79] t5:[p80..p95] t6:[p96..p111] t7:[p112..p127] t8:[p128..p143] t9:[p144..p159] t10:[p160..p175] t11:[p176..p191] t12:[p192..p207] t13:[p208..p223] t14:[p224..p239] t15:[p240..p255]
           │ FilterExec: p_brand@1 = Brand#23 AND p_container@2 = MED BOX, projection=[p_partkey@0]
-          │   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=1
-          │     PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0]
-          │       DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet], [/api/parquet/part/2.parquet], [/api/parquet/part/3.parquet], [/api/parquet/part/4.parquet]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │   RepartitionExec: partitioning=RoundRobinBatch(16), input_partitions=4
+          │     DistributedLeafExec:
+          │       t0: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:0..558], [/api/parquet/part/1.parquet:8928..8942, /api/parquet/part/2.parquet:0..544], [/api/parquet/part/3.parquet:115..673], [/api/parquet/part/4.parquet:24..582]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t1: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:558..1116], [/api/parquet/part/2.parquet:544..1102], [/api/parquet/part/3.parquet:673..1231], [/api/parquet/part/4.parquet:582..1140]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t2: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:1116..1674], [/api/parquet/part/2.parquet:1102..1660], [/api/parquet/part/3.parquet:1231..1789], [/api/parquet/part/4.parquet:1140..1698]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t3: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:1674..2232], [/api/parquet/part/2.parquet:1660..2218], [/api/parquet/part/3.parquet:1789..2347], [/api/parquet/part/4.parquet:1698..2256]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t4: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:2232..2790], [/api/parquet/part/2.parquet:2218..2776], [/api/parquet/part/3.parquet:2347..2905], [/api/parquet/part/4.parquet:2256..2814]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t5: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:2790..3348], [/api/parquet/part/2.parquet:2776..3334], [/api/parquet/part/3.parquet:2905..3463], [/api/parquet/part/4.parquet:2814..3372]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t6: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:3348..3906], [/api/parquet/part/2.parquet:3334..3892], [/api/parquet/part/3.parquet:3463..4021], [/api/parquet/part/4.parquet:3372..3930]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t7: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:3906..4464], [/api/parquet/part/2.parquet:3892..4450], [/api/parquet/part/3.parquet:4021..4579], [/api/parquet/part/4.parquet:3930..4488]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t8: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:4464..5022], [/api/parquet/part/2.parquet:4450..5008], [/api/parquet/part/3.parquet:4579..5137], [/api/parquet/part/4.parquet:4488..5046]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t9: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:5022..5580], [/api/parquet/part/2.parquet:5008..5566], [/api/parquet/part/3.parquet:5137..5695], [/api/parquet/part/4.parquet:5046..5604]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t10: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:5580..6138], [/api/parquet/part/2.parquet:5566..6124], [/api/parquet/part/3.parquet:5695..6253], [/api/parquet/part/4.parquet:5604..6162]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t11: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:6138..6696], [/api/parquet/part/2.parquet:6124..6682], [/api/parquet/part/3.parquet:6253..6811], [/api/parquet/part/4.parquet:6162..6720]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t12: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:6696..7254], [/api/parquet/part/2.parquet:6682..7240], [/api/parquet/part/3.parquet:6811..7369], [/api/parquet/part/4.parquet:6720..7278]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t13: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:7254..7812], [/api/parquet/part/2.parquet:7240..7798], [/api/parquet/part/3.parquet:7369..7927], [/api/parquet/part/4.parquet:7278..7836]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t14: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:7812..8370], [/api/parquet/part/2.parquet:7798..8356], [/api/parquet/part/3.parquet:7927..8485], [/api/parquet/part/4.parquet:7836..8394]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
+          │       t15: DataSourceExec: file_groups={4 groups: [[/api/parquet/part/1.parquet:8370..8928], [/api/parquet/part/2.parquet:8356..8799, /api/parquet/part/3.parquet:0..115], [/api/parquet/part/3.parquet:8485..9019, /api/parquet/part/4.parquet:0..24], [/api/parquet/part/4.parquet:8394..8926]]}, projection=[p_partkey, p_brand, p_container], file_type=parquet, predicate=p_brand@3 = Brand#23 AND p_container@6 = MED BOX, pruning_predicate=p_brand_null_count@2 != row_count@3 AND p_brand_min@0 <= Brand#23 AND Brand#23 <= p_brand_max@1 AND p_container_null_count@6 != row_count@3 AND p_container_min@4 <= MED BOX AND MED BOX <= p_container_max@5, required_guarantees=[p_brand in (Brand#23), p_container in (MED BOX)]
           └──────────────────────────────────────────────────
-          ┌───── Stage 2 ── Tasks: t0:[p0..p15] t1:[p0..p15] t2:[p0..p15] t3:[p0..p15] 
-          │ RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=1
+          ┌───── Stage 2 ── Tasks: t0:[p0..p15] t1:[p0..p15] t2:[p0..p15] t3:[p0..p15] t4:[p0..p15] t5:[p0..p15] t6:[p0..p15] t7:[p0..p15] t8:[p0..p15] t9:[p0..p15] t10:[p0..p15] t11:[p0..p15] t12:[p0..p15] t13:[p0..p15] t14:[p0..p15] t15:[p0..p15]
+          │ RepartitionExec: partitioning=Hash([l_partkey@0], 16), input_partitions=4
           │   AggregateExec: mode=Partial, gby=[l_partkey@0 as l_partkey], aggr=[avg(lineitem.l_quantity)]
-          │     PartitionIsolatorExec: t0:[p0,__,__,__] t1:[__,p0,__,__] t2:[__,__,p0,__] t3:[__,__,__,p0]
-          │       DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet], [/api/parquet/lineitem/2.parquet], [/api/parquet/lineitem/3.parquet], [/api/parquet/lineitem/4.parquet]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │     DistributedLeafExec:
+          │       t0: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:0..6265], [/api/parquet/lineitem/2.parquet:1173..7438], [/api/parquet/lineitem/2.parquet:101413..103266, /api/parquet/lineitem/3.parquet:0..4412], [/api/parquet/lineitem/3.parquet:98387..99389, /api/parquet/lineitem/4.parquet:0..5263]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t1: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:6265..12530], [/api/parquet/lineitem/2.parquet:7438..13703], [/api/parquet/lineitem/3.parquet:4412..10677], [/api/parquet/lineitem/4.parquet:5263..11528]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t2: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:12530..18795], [/api/parquet/lineitem/2.parquet:13703..19968], [/api/parquet/lineitem/3.parquet:10677..16942], [/api/parquet/lineitem/4.parquet:11528..17793]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t3: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:18795..25060], [/api/parquet/lineitem/2.parquet:19968..26233], [/api/parquet/lineitem/3.parquet:16942..23207], [/api/parquet/lineitem/4.parquet:17793..24058]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t4: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:25060..31325], [/api/parquet/lineitem/2.parquet:26233..32498], [/api/parquet/lineitem/3.parquet:23207..29472], [/api/parquet/lineitem/4.parquet:24058..30323]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t5: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:31325..37590], [/api/parquet/lineitem/2.parquet:32498..38763], [/api/parquet/lineitem/3.parquet:29472..35737], [/api/parquet/lineitem/4.parquet:30323..36588]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t6: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:37590..43855], [/api/parquet/lineitem/2.parquet:38763..45028], [/api/parquet/lineitem/3.parquet:35737..42002], [/api/parquet/lineitem/4.parquet:36588..42853]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t7: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:43855..50120], [/api/parquet/lineitem/2.parquet:45028..51293], [/api/parquet/lineitem/3.parquet:42002..48267], [/api/parquet/lineitem/4.parquet:42853..49118]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t8: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:50120..56385], [/api/parquet/lineitem/2.parquet:51293..57558], [/api/parquet/lineitem/3.parquet:48267..54532], [/api/parquet/lineitem/4.parquet:49118..55383]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t9: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:56385..62650], [/api/parquet/lineitem/2.parquet:57558..63823], [/api/parquet/lineitem/3.parquet:54532..60797], [/api/parquet/lineitem/4.parquet:55383..61648]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t10: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:62650..68915], [/api/parquet/lineitem/2.parquet:63823..70088], [/api/parquet/lineitem/3.parquet:60797..67062], [/api/parquet/lineitem/4.parquet:61648..67913]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t11: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:68915..75180], [/api/parquet/lineitem/2.parquet:70088..76353], [/api/parquet/lineitem/3.parquet:67062..73327], [/api/parquet/lineitem/4.parquet:67913..74178]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t12: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:75180..81445], [/api/parquet/lineitem/2.parquet:76353..82618], [/api/parquet/lineitem/3.parquet:73327..79592], [/api/parquet/lineitem/4.parquet:74178..80443]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t13: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:81445..87710], [/api/parquet/lineitem/2.parquet:82618..88883], [/api/parquet/lineitem/3.parquet:79592..85857], [/api/parquet/lineitem/4.parquet:80443..86708]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t14: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:87710..93975], [/api/parquet/lineitem/2.parquet:88883..95148], [/api/parquet/lineitem/3.parquet:85857..92122], [/api/parquet/lineitem/4.parquet:86708..92973]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
+          │       t15: DataSourceExec: file_groups={4 groups: [[/api/parquet/lineitem/1.parquet:93975..99067, /api/parquet/lineitem/2.parquet:0..1173], [/api/parquet/lineitem/2.parquet:95148..101413], [/api/parquet/lineitem/3.parquet:92122..98387], [/api/parquet/lineitem/4.parquet:92973..99206]]}, projection=[l_partkey, l_quantity], file_type=parquet, predicate=DynamicFilter [ empty ]
           └──────────────────────────────────────────────────
         ");
         Ok(())
