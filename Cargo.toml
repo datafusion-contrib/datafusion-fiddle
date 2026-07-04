@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["macros"], default-features = false }
+tokio = { version = "1", features = ["full"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Documentation: https://docs.rs/vercel_runtime/latest/vercel_runtime
-# Pinned to =1.1.4: 1.1.5+ bumped to lambda_runtime 0.14.x, which panics on the
-# vercel-rust runtime with "Missing AWS_LAMBDA_FUNCTION_NAME". 1.1.4 uses
-# lambda_runtime 0.11.3 (the version this app was previously deployed on).
-vercel_runtime = { version = "=1.1.4" }
+vercel_runtime = { version = "2" }
 datafusion = { version = "54", default-features = false }
 datafusion-distributed = { version = "2.0.0" }
 serde = { version = "1.0.203", features = ["derive"] }
@@ -21,6 +18,7 @@ tonic = { version="0.14", default-features = false }
 tokio-stream = "0.1.17"
 tower = { version = "0.5.2", default-features = false }
 hyper-util = "0.1.16"
+http-body-util = "0.1"
 
 [dev-dependencies]
 insta = "1.43.2"
@@ -28,6 +26,13 @@ tabled = "0.20.0"
 
 # Optimize as much as possible even in debug mode, otherwise the binary size will be more than 50 Mb (vercel limit).
 [profile.dev.package."*"]
+opt-level = 3
+
+# Deploys build in release mode. The official docs suggest lto = "fat", but that
+# LTO step is largely serial and too slow on Vercel's 2-core build machines, so
+# use thin LTO. https://vercel.com/docs/functions/runtimes/rust
+[profile.release]
+lto = "thin"
 opt-level = 3
 
 # Each handler has to be specified as [[bin]]

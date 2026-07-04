@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:api": "VERCEL_DEV=1 VERCEL_DEV_PORT=3141 cargo run --bin sql",
     "start": "vercel dev",
     "build": "vite build",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
