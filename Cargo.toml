@@ -7,7 +7,10 @@ edition = "2021"
 tokio = { version = "1", features = ["macros"], default-features = false }
 serde_json = { version = "1", features = ["raw_value"] }
 # Documentation: https://docs.rs/vercel_runtime/latest/vercel_runtime
-vercel_runtime = { version = "1.1.6" }
+# Pinned to =1.1.4: 1.1.5+ bumped to lambda_runtime 0.14.x, which panics on the
+# vercel-rust runtime with "Missing AWS_LAMBDA_FUNCTION_NAME". 1.1.4 uses
+# lambda_runtime 0.11.3 (the version this app was previously deployed on).
+vercel_runtime = { version = "=1.1.4" }
 datafusion = { version = "54", default-features = false }
 datafusion-distributed = { version = "2.0.0" }
 serde = { version = "1.0.203", features = ["derive"] }
