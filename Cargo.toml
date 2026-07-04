@@ -4,12 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["macros"], default-features = false }
+tokio = { version = "1", features = ["full"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Documentation: https://docs.rs/vercel_runtime/latest/vercel_runtime
-vercel_runtime = { version = "1.1.6" }
-datafusion = { version = "52.2.0", default-features = false }
-datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "5dcab28e44033234327220776992ad38425ad088" }
+vercel_runtime = { version = "2" }
+datafusion = { version = "54", default-features = false }
+datafusion-distributed = { version = "2.0.0" }
 serde = { version = "1.0.203", features = ["derive"] }
 futures = "0.3.31"
 url = "2.5.7"
@@ -18,7 +18,7 @@ tonic = { version="0.14", default-features = false }
 tokio-stream = "0.1.17"
 tower = { version = "0.5.2", default-features = false }
 hyper-util = "0.1.16"
-arrow-flight = { version = "57", default-features = false }
+http-body-util = "0.1"
 
 [dev-dependencies]
 insta = "1.43.2"
@@ -26,6 +26,13 @@ tabled = "0.20.0"
 
 # Optimize as much as possible even in debug mode, otherwise the binary size will be more than 50 Mb (vercel limit).
 [profile.dev.package."*"]
+opt-level = 3
+
+# Deploys build in release mode. The official docs suggest lto = "fat", but that
+# LTO step is largely serial and too slow on Vercel's 2-core build machines, so
+# use thin LTO. https://vercel.com/docs/functions/runtimes/rust
+[profile.release]
+lto = "thin"
 opt-level = 3
 
 # Each handler has to be specified as [[bin]]

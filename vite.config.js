@@ -14,5 +14,11 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    // `vercel dev` cannot serve the official @vercel/rust runtime locally, so for
+    // local dev run the function binary separately (`pnpm dev:api`) and proxy /api
+    // to it. The binary is a plain HTTP server on VERCEL_DEV_PORT (see vercel_runtime).
+    proxy: {
+      '/api': 'http://127.0.0.1:3141',
+    },
   },
 })

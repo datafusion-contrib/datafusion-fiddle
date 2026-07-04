@@ -73,16 +73,28 @@ setupLanguageFeatures(LanguageIdEnum.PG, {
         })
       } else if (["SET distributed.", "set distributed."].includes(line)) {
         syntaxCompletionItems.push({
-          label: "files_per_task = ",
+          label: "file_scan_config_bytes_per_partition = ",
           kind: languages.CompletionItemKind.Constant,
           detail: '',
-          sortText: '1_files_per_task'
+          sortText: '1_file_scan_config_bytes_per_partition'
         })
         syntaxCompletionItems.push({
           label: "cardinality_task_count_factor = ",
           kind: languages.CompletionItemKind.Constant,
           detail: '',
           sortText: '1_cardinality_task_count_factor'
+        })
+        syntaxCompletionItems.push({
+          label: "dynamic_task_count = ",
+          kind: languages.CompletionItemKind.Constant,
+          detail: '',
+          sortText: '1_dynamic_task_count'
+        })
+        syntaxCompletionItems.push({
+          label: "bytes_per_partition_per_second = ",
+          kind: languages.CompletionItemKind.Constant,
+          detail: '',
+          sortText: '1_bytes_per_partition_per_second'
         })
       }
 
