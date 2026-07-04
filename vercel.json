@@ -8,7 +8,8 @@
   },
   "functions": {
     "api/**/*.rs": {
-      "runtime": "@vercel/rust@1.4.0",
+      "runtime": "vercel-rust@4.0.11",
+      "excludeFiles": "**",
       "includeFiles": "api/**"
     }
   },
